@@ -70,6 +70,7 @@ def get_param(tag):
     props = config[tag]
     v = dpg.get_value(tag)
     if 'units' in props: v = props['gui2sim_units'](v)
+        v = props['gui2sim_units'](v)
     return v
 
 def upd_direct_param(k): # TODO: no clam version
