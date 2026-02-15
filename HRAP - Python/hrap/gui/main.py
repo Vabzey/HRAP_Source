@@ -69,7 +69,7 @@ def clamped_param(val, props):
 def get_param(tag):
     props = config[tag]
     v = dpg.get_value(tag)
-    if 'units' in props: v = props['gui2sim_units'](v)
+    if 'units' in props and callable(props['gui2sim_units']): 
         v = props['gui2sim_units'](v)
     return v
 
@@ -403,6 +403,13 @@ def main():
         for tag, val in save['config'].items():
             set_param(tag, val)
         init_deps()
+        # Restore readonly state of the density field based on the loaded checkbox value,
+        # then if estimation is OFF re-push the saved density so recompile_motor's trailing
+        # prep_chem() cannot overwrite it with the formula-estimated value.
+        use_est = dpg.get_value('grn_est_rho')
+        dpg.configure_item('grn_rho', readonly=use_est)
+        if not use_est and 'grn_rho' in save_config:
+            set_param('grn_rho', save_config['grn_rho'])    
     
     default_settings = {
         'view_w': 1000, 'view_h': 1000*6//8,
@@ -515,10 +522,15 @@ def main():
         set_whxy('misc',    vw // 2, vh // 6,      0,       vh // 2)
         set_whxy('nozzle',  vw // 2, vh // 6,      vw // 2, vh // 3    )
         set_whxy('numerics',vw // 2, vh // 6,      vw // 2, vh // 2    )
-        set_whxy('previewL', vw // 2, vh // 3,     0,       2 * vh // 3)
-        set_whxy('previewR', vw // 2, vh // 3,     vw // 2, 2 * vh // 3)
+        # Bottom row: thrust plot | metrics | pressure plot  (each ~1/3 wide)
+        bw = vw // 3          # width of each bottom panel
+        bh = vh // 3          # height of bottom row
+        by = 2 * vh // 3      # y-start of bottom row
+        set_whxy('previewL', bw,      bh, 0,        by)
+        set_whxy('metrics',  vw-2*bw, bh, bw,       by)   # centre panel (absorbs rounding)
+        set_whxy('previewR', bw,      bh, vw-bw,    by)
 
-        for i in range(2): set_wh('preview_{i}'.format(i=i), vw // 2 - 18, vh // 3 - 36)
+        for i in range(2): set_wh('preview_{i}'.format(i=i), bw - 18, bh - 36)
 
     # First row
     dpg_settings = { 'no_move': True, 'no_collapse': True, 'no_resize': True, 'no_close': True }
@@ -869,6 +881,7 @@ def main():
                 })
                 with dpg.table_row():
                     dpg.add_checkbox(label='Use Estimated Density', tag='grn_est_rho', default_value=True, callback=lambda: [recompile_motor(), dpg.configure_item('grn_rho', readonly=dpg.get_value('grn_est_rho'))])
+                    config['grn_est_rho'] = { 'type': bool, 'direct': False }  # register so save/load includes it
                 make_param('Density', {
                     'type': float,
                     'tag': 'grn_rho', 'direct': True,
@@ -1072,6 +1085,32 @@ def main():
                 dpg.add_plot_axis(dpg.mvXAxis, label='t (s)')
                 dpg.add_plot_axis(dpg.mvYAxis, label='Thrust (N)', tag=plt_tag+'_y_axis')
                 dpg.add_line_series([], [], label='Total', parent=plt_tag+'_y_axis', tag=plt_tag+'_series')
+
+        # ── Performance Metrics panel ─────────────────────────────────────────────
+        with dpg.window(tag='metrics', label='Performance Metrics', **dpg_settings):
+            dpg.add_spacer(height=4)
+            with dpg.table(header_row=False, resizable=False, borders_innerV=True,
+                           borders_innerH=True,
+                           policy=dpg.mvTable_SizingStretchProp):
+                dpg.add_table_column(init_width_or_weight=1.0)  # label
+                dpg.add_table_column(init_width_or_weight=1.0)  # value
+
+                with dpg.table_row():
+                    dpg.add_text('Total Impulse')
+                    dpg.add_text('—', tag='perf_total_impulse')
+                with dpg.table_row():
+                    dpg.add_text('Max Thrust')
+                    dpg.add_text('—', tag='perf_max_thrust')
+                with dpg.table_row():
+                    dpg.add_text('Average Thrust')
+                    dpg.add_text('—', tag='perf_avg_thrust')
+                with dpg.table_row():
+                    dpg.add_text('Burn Time')
+                    dpg.add_text('—', tag='perf_burn_time')
+                with dpg.table_row():
+                    dpg.add_text('Specific Impulse (Isp)')
+                    dpg.add_text('—', tag='perf_isp')
+
         i, preview_win_tag = 1, 'previewR'
         with dpg.window(tag=preview_win_tag, label='Preview', **dpg_settings):
             plt_tag = f'preview_{i}'
@@ -1129,6 +1168,30 @@ def main():
             dpg.set_value('preview_0_series', [_t, np.copy(thrust[::10])])
             dpg.set_value('preview_1_series', [_t, np.copy(tnk_P[::10])])
             print('max engine fps', 1/(t2-t10))
+
+            # ── Compute and display performance metrics ──────────────────────────────
+            # Mirror the nonzero-window trimming used in export_rse / export_eng so
+            # all four values are consistent with what gets written to file.
+            nz = np.argwhere(thrust > 0.0)
+            if nz.size > 0:
+                t_s, t_e = int(nz[0, 0]), int(nz[-1, 0])
+                _F = thrust[t_s:t_e + 1]
+                _t_trim = np.array(t[t_s:t_e + 1])
+                _prop_mdot = xstack[t_s:t_e + 1, method['xmap']['noz_mdot']]
+                T_burn = float(_t_trim[-1] - _t_trim[0])
+                Itot   = float(np.trapezoid(_F, _t_trim))
+                F_max  = float(np.max(_F))
+                F_avg  = Itot / T_burn if T_burn > 0.0 else 0.0
+                prop_burnt = float(np.trapezoid(_prop_mdot, _t_trim))
+                Isp    = Itot / (prop_burnt * 9.81) if prop_burnt > 0.0 else 0.0
+            else:
+                T_burn = Itot = F_max = F_avg = Isp = 0.0
+
+            dpg.set_value('perf_total_impulse', f'{Itot:,.1f} N·s')
+            dpg.set_value('perf_max_thrust',    f'{F_max:,.1f} N')
+            dpg.set_value('perf_avg_thrust',    f'{F_avg:,.1f} N')
+            dpg.set_value('perf_burn_time',     f'{T_burn:.3f} s')
+            dpg.set_value('perf_isp',           f'{Isp:.1f} s')
         
         # print('render')
         dpg.render_dearpygui_frame()
